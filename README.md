@@ -114,6 +114,7 @@ time.
 |---|---|
 | `GET /admin/status` | uptime, client/model counts, today's requests/tokens/errors, last 5 min per upstream, breaker state, last request |
 | `GET /admin/upstreams` | every upstream with base, key count, mapped models, remaining cooldown |
+| `GET /admin/models` | today's tokens per client-facing model, biggest first (pins folded into the bare id) |
 | `POST /admin/upstreams/:name/reset` | clears the breaker for one upstream |
 | `GET /admin/usage?hours=24` | per-client requests, tokens, errors, avg latency |
 | `GET /admin/errors?limit=10` | newest first, entries with status ≥ 400 |
@@ -134,8 +135,10 @@ curl -s -H "x-admin-key: $ADMIN_KEY" -H 'content-type: application/json' \
   next upstream in the model's chain. Client errors (`4xx`) are never retried.
 - Streaming: SSE frames are rewritten to one JSON value per `data:` line, comments
   dropped, single `[DONE]`. This is what makes it usable from OpenCode.
-- Usage log: `{ts, client, method, path, status, attempts, ms, model, prompt_tokens,
-  completion_tokens, stream, sse_frames}`.
+  `stream_options.include_usage` is injected so token counts are logged for streams too;
+  failover stops once the first byte is on the wire.
+- Usage log: `{ts, client, method, path, status, attempts, ms, requested_model, upstream,
+  target_model, tried, model, prompt_tokens, completion_tokens, stream, sse_frames}`.
 
 ## Test
 

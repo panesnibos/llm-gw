@@ -174,10 +174,12 @@ const trip = name => {
   breakers.set(name, Date.now() + BREAKER_MS)
   console.error(`upstream "${name}" dilewati ${Math.round(BREAKER_MS / 60000)} menit (kuota/key ditolak)`)
 }
-const rewriteModel = (buf, model) => {
+// one rewrite for both the per-upstream model name and streaming usage accounting
+const patchBody = (buf, model) => {
   try {
     const j = JSON.parse(buf.toString('utf8'))
-    j.model = model
+    if (model) j.model = model
+    if (j.stream) j.stream_options = { ...(j.stream_options || {}), include_usage: true }
     return Buffer.from(JSON.stringify(j))
   } catch {
     return buf
@@ -232,6 +234,7 @@ function splitJsonValues(text) {
 function sseNormalizer() {
   let buf = ''
   let doneSent = false
+  let usage = null // last usage block seen; stream_options.include_usage puts it in the final chunk
   const emit = v => {
     if (doneSent) return ''
     if (v === '[DONE]') { doneSent = true; return 'data: [DONE]\n\n' }
@@ -268,7 +271,10 @@ function sseNormalizer() {
       const v = raw.trim()
       if (!v) continue
       if (v !== '[DONE]') {
-        try { JSON.parse(v) } catch { continue }
+        try {
+          const o = JSON.parse(v)
+          if (o && o.usage) usage = { prompt_tokens: o.usage.prompt_tokens, completion_tokens: o.usage.completion_tokens }
+        } catch { continue }
       }
       if (first && meta.length) { out += meta.join('\n') + '\n'; first = false }
       out += emit(v)
@@ -293,6 +299,7 @@ function sseNormalizer() {
       buf = ''
       return rest
     },
+    usage: () => usage,
   }
 }
 
@@ -381,7 +388,7 @@ const server = http.createServer(async (req, res) => {
     if (cooling(target.upstream)) { tried.push(target.upstream + ':cooldown'); continue }
     const u = routes.upstreams[target.upstream]
     if (!u) continue
-    const sendBody = target.model && requested && target.model !== requested ? rewriteModel(body, target.model) : body
+    const sendBody = body ? patchBody(body, target.model && target.model !== requested ? target.model : null) : body
     tried.push(target.upstream)
     let got = false
     for (let attempt = 0; attempt <= RETRIES_PER_TARGET; attempt++) {
@@ -425,6 +432,7 @@ const server = http.createServer(async (req, res) => {
     method: req.method,
     path: url.pathname,
     attempts,
+    requested_model: requested,
     upstream: used ? used.upstream : null,
     target_model: used ? used.model : null,
     tried,
@@ -456,7 +464,8 @@ const server = http.createServer(async (req, res) => {
       const tail = norm.flush()
       if (tail) { events++; res.write(tail) }
       res.end()
-      log({ ...base, stream: true, sse_frames: events, ms: Date.now() - started })
+      const us = norm.usage()
+      log({ ...base, stream: true, sse_frames: events, prompt_tokens: us?.prompt_tokens, completion_tokens: us?.completion_tokens, ms: Date.now() - started })
       return
     }
     const text = await up.text()
@@ -601,6 +610,35 @@ function aggregate(hours) {
   return { hours, since: new Date(since).toISOString(), totals, clients: out }
 }
 
+// per client-facing model since local midnight; a pin prefix is stripped so
+// "netraux/free/gpt-6-luna" lands under "free/gpt-6-luna"
+function modelsUsage() {
+  const dayStart = new Date()
+  dayStart.setHours(0, 0, 0, 0)
+  const rows = new Map()
+  scanLog(r => {
+    if ((Date.parse(r.ts) || 0) < dayStart.getTime()) return
+    const raw = r.requested_model || r.target_model
+    if (!raw) return
+    const s = String(raw)
+    const i = s.indexOf('/')
+    const model = i > 0 && routes.upstreams[s.slice(0, i)] ? s.slice(i + 1) : s
+    const row = rows.get(model) || { model, requests: 0, prompt_tokens: 0, completion_tokens: 0, errors: 0 }
+    row.requests++
+    row.prompt_tokens += num(r.prompt_tokens)
+    row.completion_tokens += num(r.completion_tokens)
+    if (num(r.status) >= 400) row.errors++
+    rows.set(model, row)
+  })
+  const models = [...rows.values()].sort(
+    (a, b) => b.prompt_tokens + b.completion_tokens - (a.prompt_tokens + a.completion_tokens)
+  )
+  return {
+    since: dayStart.toISOString(),
+    models: models.map(m => ({ ...m, tokens: m.prompt_tokens + m.completion_tokens })),
+  }
+}
+
 function recentErrors(limit) {
   const out = []
   scanLog(r => {
@@ -646,6 +684,7 @@ const admin = http.createServer(async (req, res) => {
     const hours = Math.min(24 * 30, Math.max(1, Number(url.searchParams.get('hours')) || 24))
     return json(res, 200, aggregate(hours))
   }
+  if (req.method === 'GET' && p === '/admin/models') return json(res, 200, modelsUsage())
   if (req.method === 'GET' && p === '/admin/errors') {
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 10))
     return json(res, 200, { errors: recentErrors(limit) })

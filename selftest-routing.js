@@ -15,7 +15,7 @@ const P_PORT = 18990
 const B_PORT = 18991
 
 const calls = { primary: 0, backup: 0 }
-const seen = { backup: [] }
+const seen = { backup: [], streamOpts: [] }
 
 const fake = (port, handler) =>
   new Promise((resolve) => {
@@ -71,11 +71,11 @@ const env = {
 
 const A = `http://127.0.0.1:${ADMIN_PORT}`
 const adm = (p, opt = {}) => fetch(A + p, { ...opt, headers: { 'x-admin-key': ADMIN_KEY, ...(opt.headers || {}) } })
-const chat = (model) =>
+const chat = (model, extra = {}) =>
   fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { authorization: 'Bearer sk-gw-000000000000000000000000000000000000000000000000', 'content-type': 'application/json' },
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], ...extra }),
   })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -84,13 +84,14 @@ const ok = (name, cond, extra = '') => {
   console.log((cond ? 'ok   ' : 'FAIL ') + name + (extra ? ' (' + extra + ')' : ''))
   if (!cond) fails.push(name)
 }
-const lastLog = async () => {
+const lastLog = async (pred) => {
   for (let i = 0; i < 60; i++) {
     try {
       const text = fs.readFileSync(env.LOG_FILE, 'utf8').trim()
       if (text) {
         const lines = text.split('\n')
-        return JSON.parse(lines[lines.length - 1])
+        const rec = JSON.parse(lines[lines.length - 1])
+        if (!pred || pred(rec)) return rec
       }
     } catch {}
     await sleep(50)
@@ -106,8 +107,17 @@ const lastLog = async () => {
     }),
     await fake(B_PORT, (req, res, body) => {
       calls.backup++
-      const model = JSON.parse(body).model
+      const j = JSON.parse(body)
+      const model = j.model
       seen.backup.push(model)
+      if (j.stream) {
+        seen.streamOpts.push(j.stream_options || null)
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write('data: {"id":"x","object":"chat.completion.chunk","model":"' + model + '","choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n')
+        res.write('data: {"id":"x","object":"chat.completion.chunk","model":"' + model + '","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}\n\n')
+        res.end('data: [DONE]\n\n')
+        return
+      }
       jsonRes(res, 200, {
         id: 'x',
         object: 'chat.completion',
@@ -158,6 +168,19 @@ const lastLog = async () => {
     r = await fetch(`http://127.0.0.1:${PORT}/v1/models`, { headers: { authorization: 'Bearer sk-gw-000000000000000000000000000000000000000000000000' } })
     const cat = await r.json()
     ok('v1/models dari peta routing', cat.data.length === 1 && cat.data[0].id === 'prem/deepseek-v4.1-flash-1017')
+
+    r = await chat('prem/deepseek-v4.1-flash-1017', { stream: true })
+    const sse = await r.text()
+    ok('stream diteruskan ke client', r.status === 200 && sse.includes('[DONE]'), 'status=' + r.status)
+    ok('gateway minta usage ke upstream', seen.streamOpts.length === 1 && seen.streamOpts[0] && seen.streamOpts[0].include_usage === true, JSON.stringify(seen.streamOpts))
+    log = await lastLog((x) => x.stream === true)
+    ok('log stream mencatat token', log.prompt_tokens === 5 && log.completion_tokens === 7, JSON.stringify({ p: log.prompt_tokens, c: log.completion_tokens }))
+    ok('log mencatat model yang diminta client', log.requested_model === 'prem/deepseek-v4.1-flash-1017', log.requested_model)
+
+    r = await adm('/admin/models')
+    const mu = await r.json()
+    const row = mu.models.find((m) => m.model === 'prem/deepseek-v4.1-flash-1017')
+    ok('admin/models menjumlah token hari ini', row && row.tokens === 18, row && JSON.stringify(row))
   } catch (err) {
     ok('no exception', false, err.message)
   } finally {
