@@ -18,6 +18,12 @@ chk chat     "$(code -H "Authorization: Bearer $K" -H 'Content-Type: application
 chk stream   "$(code -N -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
   -d '{"model":"prem/deepseek-v4.1-flash-1017","messages":[{"role":"user","content":"count 1 to 5"}],"stream":true}' \
   "$B/v1/chat/completions")" 200
+chk noroute  "$(code -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
+  -d '{"model":"tidak/ada","messages":[{"role":"user","content":"hi"}]}' \
+  "$B/v1/chat/completions")" 400
+chk pin      "$(code -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
+  -d '{"model":"freeai/prem/deepseek-v4.1-flash-1017","messages":[{"role":"user","content":"say ok"}],"max_tokens":8}' \
+  "$B/v1/chat/completions")" 200
 
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit $fail

@@ -46,15 +46,56 @@ Read from the environment (`.env` via the systemd unit).
 |---|---|---|
 | `PORT` | `8080` | public listener |
 | `HOST` | `127.0.0.1` | keep on loopback; expose via tunnel |
-| `UPSTREAM_BASE` | `https://free.ai.id/v1` | must include `/v1` |
-| `UPSTREAM_KEYS` | — | comma-separated, rotated round-robin |
+| `ROUTES_FILE` | `/root/llm-gw/upstreams.json` | upstreams + model routing, hot-reloaded |
+| `UPSTREAM_BASE` | `https://free.ai.id/v1` | only used when `upstreams.json` is missing |
+| `UPSTREAM_KEYS` | — | same, comma-separated |
 | `KEYS_FILE` | `/root/llm-gw/keys.json` | client keys, hot-reloaded |
 | `CLIENT_KEYS` | — | `label:key,...`; only seeds `keys.json` on first run |
 | `LOG_FILE` | `./usage.jsonl` | JSONL, one line per request |
 | `ADMIN_HOST` | `127.0.0.1` | admin listener, loopback only |
 | `ADMIN_PORT` | `8081` | not exposed through the tunnel |
 | `ADMIN_KEY` | — | admin API disabled when empty |
-| `MAX_RETRIES` | `2` | extra attempts after the first (3 total) |
+| `BREAKER_MS` | `300000` | how long an upstream is skipped after `401`/`402` |
+| `TOTAL_BUDGET_MS` | `90000` | ceiling for one request across all upstreams |
+
+## Upstreams and routing
+
+`upstreams.json` (chmod 600, gitignored, hot-reloaded) maps each client-facing model
+name to an ordered list of upstreams:
+
+```json
+{
+  "upstreams": {
+    "freeai":  { "base": "https://free.ai.id/v1",       "keys": ["sk-..."] },
+    "netraux": { "base": "https://ai.netraux.eu.cc/v1", "keys": ["zx-..."] }
+  },
+  "models": {
+    "prem/glm-5.3-flash": [
+      { "upstream": "freeai",  "model": "prem/glm-5.3-flash" },
+      { "upstream": "netraux", "model": "free/glm-5.3-flash" }
+    ],
+    "free/gpt-6-luna": [
+      { "upstream": "netraux", "model": "free/gpt-6-luna" }
+    ]
+  }
+}
+```
+
+A request resolves like this:
+
+1. `netraux/free/gpt-6-luna` — the first segment names an upstream, so it **pins** to
+   `netraux` and sends `free/gpt-6-luna`. No failover.
+2. `prem/glm-5.3-flash` — no upstream by that name, so the chain in `models` is walked
+   in order. Each target is retried twice (700 ms apart) on network/`408`/`429`/`5xx`,
+   then the next target is tried with its own model name.
+3. A model that is in neither place gets `400` with the list of routed models.
+4. A `401`/`402` from an upstream trips a breaker (`BREAKER_MS`): that upstream is
+   skipped entirely, so the next request goes straight to the backup.
+5. Failover stops once streaming has started — the bytes are already on the wire.
+
+An upstream name must not match the first segment of a mapped model, otherwise the
+config is rejected on load with a message saying so. `/v1/models` is generated from
+the `models` map, so clients see exactly what is routed.
 
 ## Client keys
 
@@ -71,7 +112,9 @@ time.
 
 | Endpoint | Returns |
 |---|---|
-| `GET /admin/status` | uptime, client count, today's requests/tokens/errors, last 5 min error counts, last request |
+| `GET /admin/status` | uptime, client/model counts, today's requests/tokens/errors, last 5 min per upstream, breaker state, last request |
+| `GET /admin/upstreams` | every upstream with base, key count, mapped models, remaining cooldown |
+| `POST /admin/upstreams/:name/reset` | clears the breaker for one upstream |
 | `GET /admin/usage?hours=24` | per-client requests, tokens, errors, avg latency |
 | `GET /admin/errors?limit=10` | newest first, entries with status ≥ 400 |
 | `GET /admin/keys` | labels with masked keys |
@@ -87,7 +130,8 @@ curl -s -H "x-admin-key: $ADMIN_KEY" -H 'content-type: application/json' \
 ## Behaviour
 
 - Auth: `Authorization: Bearer <client key>`. Keys are compared as SHA-256 hashes.
-- Retry: network error, `408`, `429`, `5xx`. Client errors (`4xx`) are not retried.
+- Retry: network error, `408`, `429`, `5xx` — twice per upstream, then fail over to the
+  next upstream in the model's chain. Client errors (`4xx`) are never retried.
 - Streaming: SSE frames are rewritten to one JSON value per `data:` line, comments
   dropped, single `[DONE]`. This is what makes it usable from OpenCode.
 - Usage log: `{ts, client, method, path, status, attempts, ms, model, prompt_tokens,
@@ -97,10 +141,11 @@ curl -s -H "x-admin-key: $ADMIN_KEY" -H 'content-type: application/json' \
 
 ```bash
 ./selftest.sh http://127.0.0.1:8080 sk-gw-...
-node selftest-admin.js       # spawns a throwaway instance, touches nothing
+node selftest-admin.js       # admin API, throwaway instance, touches nothing
+node selftest-routing.js     # failover/breaker/pin against two fake upstreams
 ```
 
-Expected: `ALL PASS` from both.
+Expected: `ALL PASS` from all three.
 
 ## Deploy
 

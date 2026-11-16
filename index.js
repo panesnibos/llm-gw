@@ -6,16 +6,19 @@ const fs = require('node:fs')
 
 const PORT = Number(process.env.PORT || 8080)
 const HOST = process.env.HOST || '127.0.0.1'
-const UPSTREAM = (process.env.UPSTREAM_BASE || 'https://free.ai.id/v1').replace(/\/+$/, '')
-const UP_KEYS = (process.env.UPSTREAM_KEYS || '').split(',').map(s => s.trim()).filter(Boolean)
+const ROUTES_FILE = process.env.ROUTES_FILE || '/root/llm-gw/upstreams.json'
 const LOG_FILE = process.env.LOG_FILE || '/root/llm-gw/usage.jsonl'
 const MAX_BODY = 25 * 1024 * 1024
 const UP_TIMEOUT_MS = 120000
 const MODELS_TTL_MS = 300000
-const MAX_RETRIES = 2
+const RETRIES_PER_TARGET = 1 // 2 attempts per upstream, then fail over
 const RETRY_DELAYS = [700, 1500]
+const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS || 90000)
+const BREAKER_MS = Number(process.env.BREAKER_MS || 5 * 60 * 1000)
 // 4xx request errors are not retried: same request would fail the same way
 const retryable = s => s === 408 || s === 429 || s >= 500
+// 401/402 mean the upstream account itself is unusable -> breaker + failover
+const accountLevel = s => s === 401 || s === 402
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 const sha = s => crypto.createHash('sha256').update(String(s)).digest('hex')
@@ -80,8 +83,109 @@ function loadKeys() {
 const randomKey = () => 'sk-gw-' + crypto.randomBytes(24).toString('hex')
 const maskKey = k => k.slice(0, 11) + '…' + k.slice(-4)
 
+// --- upstream routing ------------------------------------------------------
+// upstreams.json is authoritative and hot-reloaded. UPSTREAM_BASE/UPSTREAM_KEYS
+// in .env remain a single-upstream fallback for a fresh install.
+let routes = { upstreams: {}, models: {} }
+let routesStamp = null
+let routesReady = false
+const breakers = new Map() // upstream name -> cool-until timestamp
+const rrIndex = new Map() // upstream name -> round-robin key index
+
+function parseRoutes(text) {
+  const cfg = JSON.parse(text)
+  const upstreams = {}
+  for (const [name, u] of Object.entries(cfg.upstreams || {})) {
+    const base = String((u && u.base) || '').replace(/\/+$/, '')
+    const keys = (Array.isArray(u && u.keys) ? u.keys : [u && u.keys]).map(k => String(k || '').trim()).filter(Boolean)
+    if (!base || !keys.length) throw new Error(`upstream "${name}": base/keys tidak lengkap`)
+    upstreams[name] = { base, keys }
+  }
+  if (!Object.keys(upstreams).length) throw new Error('upstreams kosong')
+  const models = {}
+  for (const [id, list] of Object.entries(cfg.models || {})) {
+    const targets = (Array.isArray(list) ? list : [])
+      .map(t => ({ upstream: String((t && t.upstream) || ''), model: String((t && t.model) || id) }))
+      .filter(t => t.upstream)
+    if (!targets.length) continue
+    for (const t of targets) {
+      if (!upstreams[t.upstream]) throw new Error(`model "${id}": upstream "${t.upstream}" tidak dikenal`)
+    }
+    models[id] = targets
+  }
+  // a pin prefix that collides with a real model prefix would be ambiguous
+  for (const id of Object.keys(models)) {
+    const i = id.indexOf('/')
+    const first = i === -1 ? id : id.slice(0, i)
+    if (upstreams[first]) throw new Error(`model "${id}" bentrok dengan nama upstream "${first}"`)
+  }
+  return { upstreams, models }
+}
+
+function loadRoutes() {
+  let st = null
+  try { st = fs.statSync(ROUTES_FILE) } catch {}
+  if (routesReady && (!st || st.mtimeMs === routesStamp)) return
+  if (st) {
+    try {
+      routes = parseRoutes(fs.readFileSync(ROUTES_FILE, 'utf8'))
+      routesStamp = st.mtimeMs
+      routesReady = true
+      return
+    } catch (err) {
+      routesStamp = st.mtimeMs // report once per edit, keep serving the last good config
+      console.error(`upstreams.json ditolak: ${err.message}`)
+      if (routesReady) return
+      throw err
+    }
+  }
+  if (routesReady) return
+  const base = (process.env.UPSTREAM_BASE || 'https://free.ai.id/v1').replace(/\/+$/, '')
+  const keys = (process.env.UPSTREAM_KEYS || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (!keys.length) throw new Error(`${ROUTES_FILE} tidak ada dan UPSTREAM_KEYS kosong`)
+  routes = { upstreams: { freeai: { base, keys } }, models: {} }
+  routesReady = true
+}
+
+const upstreamNames = () => Object.keys(routes.upstreams)
+
+// "netraux/free/gpt-6-luna" pins provider netraux; a bare name walks its chain.
+function resolveTargets(model) {
+  const i = model.indexOf('/')
+  const first = i === -1 ? model : model.slice(0, i)
+  if (routes.upstreams[first]) {
+    const rest = model.slice(i + 1)
+    return rest ? [{ upstream: first, model: rest }] : []
+  }
+  const chain = routes.models[model]
+  if (chain) return chain.slice()
+  if (!Object.keys(routes.models).length) return [{ upstream: upstreamNames()[0], model }] // legacy passthrough
+  return null
+}
+
+const nextKey = name => {
+  const u = routes.upstreams[name]
+  const i = rrIndex.get(name) || 0
+  rrIndex.set(name, i + 1)
+  return u.keys[i % u.keys.length]
+}
+const cooling = name => (breakers.get(name) || 0) > Date.now()
+const trip = name => {
+  breakers.set(name, Date.now() + BREAKER_MS)
+  console.error(`upstream "${name}" dilewati ${Math.round(BREAKER_MS / 60000)} menit (kuota/key ditolak)`)
+}
+const rewriteModel = (buf, model) => {
+  try {
+    const j = JSON.parse(buf.toString('utf8'))
+    j.model = model
+    return Buffer.from(JSON.stringify(j))
+  } catch {
+    return buf
+  }
+}
+
 loadKeys()
-if (!UP_KEYS.length) { console.error('UPSTREAM_KEYS empty'); process.exit(1) }
+loadRoutes()
 if (!clients.size) { console.error(`${KEYS_FILE} has no keys and CLIENT_KEYS is empty`); process.exit(1) }
 
 function log(rec) {
@@ -192,7 +296,6 @@ function sseNormalizer() {
   }
 }
 
-let rr = 0
 let modelsCache = null
 
 const server = http.createServer(async (req, res) => {
@@ -210,8 +313,13 @@ const server = http.createServer(async (req, res) => {
     return json(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error' } })
   }
 
-  if (req.method === 'GET' && url.pathname === '/v1/models' && modelsCache && modelsCache.exp > Date.now()) {
-    return send(res, 200, modelsCache.body, modelsCache.ct)
+  loadRoutes()
+  if (req.method === 'GET' && url.pathname === '/v1/models') {
+    const ids = Object.keys(routes.models)
+    if (ids.length) {
+      return json(res, 200, { object: 'list', data: ids.map(id => ({ id, object: 'model', created: 0, owned_by: 'llm-gw' })) })
+    }
+    if (modelsCache && modelsCache.exp > Date.now()) return send(res, 200, modelsCache.body, modelsCache.ct)
   }
 
   let body
@@ -231,39 +339,107 @@ const server = http.createServer(async (req, res) => {
   const abort = new AbortController()
   res.on('close', () => abort.abort())
 
-  // UPSTREAM already carries the /v1 base, so drop the version prefix from the incoming path
-  const target = UPSTREAM + url.pathname.replace(/^\/v1(?=\/|$)/, '') + url.search
+  // every upstream base already carries /v1, so drop the version prefix from the path
+  const upstreamPath = url.pathname.replace(/^\/v1(?=\/|$)/, '') + url.search
   const headers = { 'content-type': req.headers['content-type'] || 'application/json', authorization: '' }
   if (req.headers.accept) headers.accept = req.headers.accept
 
-  let up
-  let attempts = 0
-  for (let i = 0; i <= MAX_RETRIES; i++) {
-    attempts++
-    headers.authorization = 'Bearer ' + UP_KEYS[rr++ % UP_KEYS.length]
-    try {
-      up = await fetch(target, {
-        method: req.method,
-        headers,
-        body,
-        signal: AbortSignal.any([AbortSignal.timeout(UP_TIMEOUT_MS), abort.signal]),
-      })
-    } catch {
-      up = undefined
-    }
-    if (up && !retryable(up.status)) break
-    if (i === MAX_RETRIES) break
-    if (up) { try { await up.body?.cancel() } catch {} }
-    up = undefined
-    await sleep(RETRY_DELAYS[i])
+  let requested = null
+  if (body) {
+    try { requested = JSON.parse(body.toString('utf8')).model || null } catch {}
   }
 
-  const base = { ts: new Date().toISOString(), client, method: req.method, path: url.pathname, attempts, ms: 0 }
+  let targets
+  if (!requested) {
+    targets = [{ upstream: upstreamNames()[0], model: null }] // no model in the body: pass through untouched
+  } else {
+    targets = resolveTargets(String(requested))
+    if (targets === null) {
+      log({ ts: new Date().toISOString(), client, method: req.method, path: url.pathname, status: 400, ms: 0, model: requested })
+      return json(res, 400, {
+        error: {
+          message: `model "${requested}" tidak dirutekan`,
+          type: 'invalid_request_error',
+          code: 'model_not_routed',
+          available: Object.keys(routes.models),
+        },
+      })
+    }
+    if (!targets.length) {
+      return json(res, 400, { error: { message: `model "${requested}" tidak punya upstream`, type: 'invalid_request_error' } })
+    }
+  }
+
+  const startedUp = Date.now()
+  const tried = []
+  let up
+  let used = null
+  let attempts = 0
+  let saw5xx = false
+
+  for (const target of targets) {
+    if (cooling(target.upstream)) { tried.push(target.upstream + ':cooldown'); continue }
+    const u = routes.upstreams[target.upstream]
+    if (!u) continue
+    const sendBody = target.model && requested && target.model !== requested ? rewriteModel(body, target.model) : body
+    tried.push(target.upstream)
+    let got = false
+    for (let attempt = 0; attempt <= RETRIES_PER_TARGET; attempt++) {
+      attempts++
+      headers.authorization = 'Bearer ' + nextKey(target.upstream)
+      let r
+      try {
+        r = await fetch(u.base + upstreamPath, {
+          method: req.method,
+          headers,
+          body: sendBody,
+          signal: AbortSignal.any([AbortSignal.timeout(UP_TIMEOUT_MS), abort.signal]),
+        })
+      } catch {
+        r = undefined
+      }
+      if (r && accountLevel(r.status)) {
+        trip(target.upstream) // quota/key gone: skip this upstream entirely for a while
+        try { await r.body?.cancel() } catch {}
+        r = undefined
+        break
+      }
+      if (r && !retryable(r.status)) { up = r; got = true; break }
+      if (r) {
+        if (r.status >= 500) saw5xx = true
+        try { await r.body?.cancel() } catch {}
+      }
+      if (Date.now() - startedUp > TOTAL_BUDGET_MS) break
+      if (attempt < RETRIES_PER_TARGET) await sleep(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)])
+    }
+    if (got) {
+      used = target
+      break
+    }
+    if (Date.now() - startedUp > TOTAL_BUDGET_MS) break
+  }
+
+  const base = {
+    ts: new Date().toISOString(),
+    client,
+    method: req.method,
+    path: url.pathname,
+    attempts,
+    upstream: used ? used.upstream : null,
+    target_model: used ? used.model : null,
+    tried,
+    ms: 0,
+  }
   if (process.env.DEBUG_BODY) fs.appendFileSync('/root/llm-gw/debug.jsonl', JSON.stringify({ ts: base.ts, path: url.pathname, body: body ? body.toString('utf8') : null }) + '\n')
   if (!up) {
-    const status = abort.signal.aborted ? 499 : 504
+    const status = abort.signal.aborted ? 499 : saw5xx ? 502 : 504
     log({ ...base, status })
-    return json(res, status, { error: { message: status === 499 ? 'client closed' : 'upstream unreachable' } })
+    return json(res, status, {
+      error: {
+        message: abort.signal.aborted ? 'client closed' : `semua upstream gagal (dicoba: ${tried.join(', ') || '-'})`,
+        type: 'upstream_error',
+      },
+    })
   }
   base.status = up.status
 
@@ -337,6 +513,22 @@ function scanLog(fn) {
 
 const num = v => (typeof v === 'number' && isFinite(v) ? v : 0)
 
+function upstreamSnapshot() {
+  loadRoutes()
+  const now = Date.now()
+  const counts = new Map()
+  for (const chain of Object.values(routes.models)) {
+    for (const t of chain) counts.set(t.upstream, (counts.get(t.upstream) || 0) + 1)
+  }
+  return Object.entries(routes.upstreams).map(([name, u]) => ({
+    name,
+    base: u.base,
+    keys: u.keys.length,
+    models: counts.get(name) || 0,
+    cooling_s: cooling(name) ? Math.round((breakers.get(name) - now) / 1000) : 0,
+  }))
+}
+
 function statusSnapshot() {
   const now = Date.now()
   const dayStart = new Date(now)
@@ -344,6 +536,7 @@ function statusSnapshot() {
   const win = now - 5 * 60000
   const today = { requests: 0, tokens: 0, errors: 0 }
   const last5m = { requests: 0, s5xx: 0, s429: 0, s402: 0 }
+  const byUpstream = {}
   let last = null
   scanLog(r => {
     const t = Date.parse(r.ts) || 0
@@ -357,21 +550,27 @@ function statusSnapshot() {
       if (num(r.status) >= 500) last5m.s5xx++
       if (num(r.status) === 429) last5m.s429++
       if (num(r.status) === 402) last5m.s402++
+      const name = r.upstream || '(none)'
+      const row = byUpstream[name] || (byUpstream[name] = { requests: 0, errors: 0 })
+      row.requests++
+      if (num(r.status) >= 400) row.errors++
     }
     if (!last || t >= (Date.parse(last.ts) || 0)) {
-      last = { ts: r.ts, client: r.client ?? null, status: num(r.status), ms: num(r.ms), attempts: num(r.attempts), path: r.path }
+      last = { ts: r.ts, client: r.client ?? null, status: num(r.status), ms: num(r.ms), attempts: num(r.attempts), path: r.path, upstream: r.upstream ?? null }
     }
   })
   return {
     ok: true,
     now: new Date(now).toISOString(),
     uptime_s: Math.round((now - STARTED_AT) / 1000),
-    upstream: UPSTREAM,
     ports: { public: PORT, admin: ADMIN_PORT },
     clients: clients.size,
+    models: Object.keys(routes.models).length,
     models_cache_age_s: modelsCache ? Math.round((now - modelsCache.exp + MODELS_TTL_MS) / 1000) : null,
+    upstreams: upstreamSnapshot(),
     today,
     last_5m: last5m,
+    last_5m_by_upstream: byUpstream,
     last_request: last,
   }
 }
@@ -432,6 +631,17 @@ const admin = http.createServer(async (req, res) => {
   const p = url.pathname
 
   if (req.method === 'GET' && p === '/admin/status') return json(res, 200, statusSnapshot())
+  if (req.method === 'GET' && p === '/admin/upstreams') {
+    loadRoutes()
+    return json(res, 200, { upstreams: upstreamSnapshot(), models: routes.models })
+  }
+  if (req.method === 'POST' && /^\/admin\/upstreams\/[^/]+\/reset$/.test(p)) {
+    const name = decodeURIComponent(p.split('/')[3])
+    if (!routes.upstreams[name]) return json(res, 404, { error: { message: 'no such upstream' } })
+    breakers.delete(name)
+    console.log(`admin: breaker ${name} direset`)
+    return json(res, 200, { reset: name, upstreams: upstreamSnapshot() })
+  }
   if (req.method === 'GET' && p === '/admin/usage') {
     const hours = Math.min(24 * 30, Math.max(1, Number(url.searchParams.get('hours')) || 24))
     return json(res, 200, aggregate(hours))
@@ -474,7 +684,7 @@ const admin = http.createServer(async (req, res) => {
 admin.on('clientError', (err, socket) => { try { socket.destroy() } catch {} })
 
 server.listen(PORT, HOST, () => {
-  console.log(`llm-gw on http://${HOST}:${PORT} -> ${UPSTREAM} (${UP_KEYS.length} upstream key, ${clients.size} client)`)
+  console.log(`llm-gw on http://${HOST}:${PORT} (${upstreamNames().length} upstream, ${Object.keys(routes.models).length} model, ${clients.size} client)`)
   if (!ADMIN_KEY) return console.log('admin api disabled: ADMIN_KEY not set')
   admin.listen(ADMIN_PORT, ADMIN_HOST, () => console.log(`admin api on http://${ADMIN_HOST}:${ADMIN_PORT} (${KEYS_FILE})`))
 })

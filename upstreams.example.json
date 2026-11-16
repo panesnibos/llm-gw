@@ -1,0 +1,27 @@
+{
+  "upstreams": {
+    "freeai": {
+      "base": "https://free.ai.id/v1",
+      "keys": ["sk-free.ai.id-REPLACE_ME"]
+    },
+    "netraux": {
+      "base": "https://ai.netraux.eu.cc/v1",
+      "keys": ["zx-REPLACE_ME"]
+    }
+  },
+  "models": {
+    "prem/deepseek-v4.1-flash-1017": [
+      { "upstream": "freeai", "model": "prem/deepseek-v4.1-flash-1017" }
+    ],
+    "prem/minimax-m2.7": [
+      { "upstream": "freeai", "model": "prem/minimax-m2.7" }
+    ],
+    "prem/glm-5.3-flash": [
+      { "upstream": "freeai", "model": "prem/glm-5.3-flash" },
+      { "upstream": "netraux", "model": "free/glm-5.3-flash" }
+    ],
+    "free/gpt-6-luna": [
+      { "upstream": "netraux", "model": "free/gpt-6-luna" }
+    ]
+  }
+}
