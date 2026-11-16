@@ -4,3 +4,4 @@ usage.jsonl
 debug.jsonl
 node_modules/
 *.log
+client-keys.txt
