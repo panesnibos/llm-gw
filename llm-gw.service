@@ -1,0 +1,19 @@
+[Unit]
+Description=LLM Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/llm-gw/.env
+ExecStart=/usr/bin/node /root/llm-gw/index.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/llm-gw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+.env
+keys.json
+usage.jsonl
+debug.jsonl
+node_modules/
+*.log
